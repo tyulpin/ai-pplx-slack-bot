@@ -1,14 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -18,218 +17,213 @@ import (
 )
 
 var (
-	slackClient *slack.Client
-	db          *sql.DB
+	slackToken    = "SLACK_BOT_TOKEN"
+	appToken      = "SLACK_APP_TOKEN"
+	perplexityAPI = "https://api.perplexity.ai/your-endpoint"
+	dbFile        = "hyperlinks.db"
 )
 
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type PerplexityRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+}
+
+type PerplexityResponse struct {
+	Content string `json:"content"`
+}
+
 func main() {
-	// Initialize SQLite database
-	var err error
-	db, err = sql.Open("sqlite3", "./hyperlinks.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
+	ctx := context.Background()
+	api := slack.New(slackToken, slack.OptionAppLevelToken(appToken))
+	client := socketmode.New(api)
+	db := initDB()
 
-	// Create table if not exists
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS hyperlinks (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT)`)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Initialize Slack client
-	slackClient = slack.New(
-		os.Getenv("SLACK_BOT_TOKEN"),
-		slack.OptionAppLevelToken(os.Getenv("SLACK_APP_TOKEN")),
-	)
-
-	socketClient := socketmode.New(
-		slackClient,
-		socketmode.OptionDebug(true),
-		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func(ctx context.Context, client *socketmode.Client) {
-		for {
-			select {
-			case <-ctx.Done():
-				log.Println("Shutting down socketmode listener")
-				return
-			case event := <-client.Events:
-				switch event.Type {
-				case socketmode.EventTypeEventsAPI:
-					eventsAPIEvent, ok := event.Data.(slack.EventsAPIEvent)
-					if !ok {
-						continue
-					}
-					client.Ack(*event.Request)
-					switch eventsAPIEvent.Type {
-					case slack.EventTypeMessage:
-						messageEvent, ok := eventsAPIEvent.InnerEvent.Data.(*slack.MessageEvent)
-						if !ok {
-							continue
-						}
-						handleMessage(messageEvent)
-					}
-				}
+	go func() {
+		for evt := range client.Events {
+			switch evt.Type {
+			case socketmode.EventTypeInteractive:
+				callback := evt.Data.(slack.InteractionCallback)
+				handleSlackEvent(ctx, client, db, callback)
 			}
 		}
-	}(ctx, socketClient)
+	}()
 
-	socketClient.Run()
+	client.Run()
 }
 
-func handleMessage(event *slack.MessageEvent) {
-	text := strings.TrimSpace(event.Text)
-	if strings.HasPrefix(text, "!perplexity") {
-		query := strings.TrimPrefix(text, "!perplexity")
-		response := PerplexityAPI(query)
-		slackSendMessage(event.Channel, response)
-	} else if strings.HasPrefix(text, "!savelink") {
-		url := strings.TrimPrefix(text, "!savelink")
-		err := saveHyperlink(url)
-		if err != nil {
-			slackSendMessage(event.Channel, "Error saving hyperlink: "+err.Error())
-		} else {
-			slackSendMessage(event.Channel, "Hyperlink saved successfully")
-		}
-	} else if text == "!getlink" {
-		url, err := getRandomHyperlink()
-		if err != nil {
-			slackSendMessage(event.Channel, "Error getting hyperlink: "+err.Error())
-		} else if url == "" {
-			slackSendMessage(event.Channel, "No hyperlinks available")
-		} else {
-			slackSendMessage(event.Channel, "Random hyperlink: "+url)
-		}
-	} else if text == "!listlinks" {
-		links, err := getAllHyperlinks()
-		if err != nil {
-			slackSendMessage(event.Channel, "Error listing hyperlinks: "+err.Error())
-		} else if len(links) == 0 {
-			slackSendMessage(event.Channel, "No hyperlinks saved")
-		} else {
-			message := "Saved hyperlinks:\n" + strings.Join(links, "\n")
-			slackSendMessage(event.Channel, message)
-		}
-	} else if text == "!summarize" {
-		url, err := getRandomHyperlink()
-		if err != nil {
-			slackSendMessage(event.Channel, "Error getting hyperlink: "+err.Error())
-		} else if url == "" {
-			slackSendMessage(event.Channel, "No hyperlinks available")
-		} else {
-			article, err := fetchRSS(url)
+func handleSlackEvent(ctx context.Context, client *socketmode.Client, db *sql.DB, callback slack.InteractionCallback) {
+	api := client.Client
+
+	// Process message events
+	if callback.Type == slack.InteractionTypeMessage {
+		messageText := callback.Message.Text
+		channelID := callback.Channel.ID
+
+		// Check for specific commands
+		switch {
+		case messageText == "!listlinks":
+			// List all saved hyperlinks
+			urls, err := listAllLinks(db)
 			if err != nil {
-				slackSendMessage(event.Channel, "Error fetching article: "+err.Error())
-			} else {
-				summary := PerplexityAPI("Summarize this article: " + article)
-				slackSendMessage(event.Channel, "Summary of article from "+url+":\n\n"+summary)
+				slackSendMessage(api, channelID, fmt.Sprintf("Error listing links: %v", err))
+				return
 			}
+			response := "Saved Hyperlinks:\n" + strings.Join(urls, "\n")
+			slackSendMessage(api, channelID, response)
+
+		case messageText == "!randomlink":
+			// Fetch a random hyperlink
+			url, err := fetchRandomLink(db)
+			if err != nil {
+				slackSendMessage(api, channelID, fmt.Sprintf("Error fetching random link: %v", err))
+				return
+			}
+			slackSendMessage(api, channelID, fmt.Sprintf("Random Link: %s", url))
+
+		case strings.HasPrefix(messageText, "!save "):
+			// Save a new hyperlink
+			url := strings.TrimPrefix(messageText, "!save ")
+			err := storage(db, url)
+			if err != nil {
+				slackSendMessage(api, channelID, fmt.Sprintf("Error saving link: %v", err))
+				return
+			}
+			slackSendMessage(api, channelID, fmt.Sprintf("Link saved: %s", url))
+
+		case strings.HasPrefix(messageText, "!rss "):
+			// Fetch and summarize RSS feed
+			url := strings.TrimPrefix(messageText, "!rss ")
+			summary, err := fetchRSSSummary(url)
+			if err != nil {
+				slackSendMessage(api, channelID, fmt.Sprintf("Error fetching RSS feed: %v", err))
+				return
+			}
+			slackSendMessage(api, channelID, fmt.Sprintf("RSS Summary:\n%s", summary))
+
+		default:
+			// Handle other messages, send to Perplexity API
+			request := map[string]interface{}{
+				"model": "default",
+				"messages": []Message{
+					{Role: "user", Content: messageText},
+				},
+			}
+			response, err := PerplexityAPI(ctx, request)
+			if err != nil {
+				slackSendMessage(api, channelID, fmt.Sprintf("Error communicating with Perplexity API: %v", err))
+				return
+			}
+			slackSendMessage(api, channelID, response)
 		}
 	}
 }
 
-func PerplexityAPI(query string) string {
-	apiKey := os.Getenv("PERPLEXITY_API_KEY")
-	url := "https://api.perplexity.ai/chat/completions"
+func PerplexityAPI(ctx context.Context, request map[string]interface{}) (string, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
 
-	requestBody, _ := json.Marshal(map[string]interface{}{
-		"model": "mixtral-8x7b-instruct",
-		"messages": []map[string]string{
-			{"role": "system", "content": "You are a helpful assistant."},
-			{"role": "user", "content": query},
-		},
-	})
+	req, err := http.NewRequestWithContext(ctx, "POST", perplexityAPI, bytes.NewBuffer(body))
+	if err != nil {
+		return "", err
+	}
 
-	req, _ := http.NewRequest("POST", url, strings.NewReader(string(requestBody)))
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "Error: " + err.Error()
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-
-	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
-		if choice, ok := choices[0].(map[string]interface{}); ok {
-			if message, ok := choice["message"].(map[string]interface{}); ok {
-				if content, ok := message["content"].(string); ok {
-					return content
-				}
-			}
-		}
+	var perplexityResp PerplexityResponse
+	if err := json.NewDecoder(resp.Body).Decode(&perplexityResp); err != nil {
+		return "", err
 	}
 
-	return "No response from Perplexity API"
+	return perplexityResp.Content, nil
 }
 
-func slackSendMessage(channel, message string) {
-	_, _, err := slackClient.PostMessage(channel, slack.MsgOptionText(message, false))
+func slackSendMessage(api *slack.Client, channelID, message string) error {
+	_, _, err := api.PostMessage(channelID, slack.MsgOptionText(message, false))
+	return err
+}
+
+func initDB() *sql.DB {
+	db, err := sql.Open("sqlite3", dbFile)
 	if err != nil {
-		log.Printf("Error sending message: %v", err)
+		log.Fatalf("failed to open database: %v", err)
 	}
+
+	createTableSQL := `CREATE TABLE IF NOT EXISTS hyperlinks (
+		"id" INTEGER PRIMARY KEY AUTOINCREMENT,
+		"url" TEXT NOT NULL
+	);`
+	_, err = db.Exec(createTableSQL)
+	if err != nil {
+		log.Fatalf("failed to create table: %v", err)
+	}
+
+	return db
 }
 
-func saveHyperlink(url string) error {
+func storage(db *sql.DB, url string) error {
 	_, err := db.Exec("INSERT INTO hyperlinks (url) VALUES (?)", url)
 	return err
 }
 
-func getRandomHyperlink() (string, error) {
+func fetchRandomLink(db *sql.DB) (string, error) {
+	row := db.QueryRow("SELECT id, url FROM hyperlinks ORDER BY RANDOM() LIMIT 1")
+	var id int
 	var url string
-	err := db.QueryRow("SELECT url FROM hyperlinks ORDER BY RANDOM() LIMIT 1").Scan(&url)
-	if err == sql.ErrNoRows {
-		return "", nil
+	if err := row.Scan(&id, &url); err != nil {
+		return "", err
 	}
+
+	_, err := db.Exec("DELETE FROM hyperlinks WHERE id = ?", id)
 	if err != nil {
 		return "", err
 	}
-	_, err = db.Exec("DELETE FROM hyperlinks WHERE url = ?", url)
-	if err != nil {
-		return "", err
-	}
+
 	return url, nil
 }
 
-func getAllHyperlinks() ([]string, error) {
+func listAllLinks(db *sql.DB) ([]string, error) {
 	rows, err := db.Query("SELECT url FROM hyperlinks")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var links []string
+	var urls []string
 	for rows.Next() {
 		var url string
 		if err := rows.Scan(&url); err != nil {
 			return nil, err
 		}
-		links = append(links, url)
+		urls = append(urls, url)
 	}
-	return links, nil
+
+	return urls, nil
 }
 
-func fetchRSS(url string) (string, error) {
+func fetchRSSSummary(url string) (string, error) {
 	fp := gofeed.NewParser()
 	feed, err := fp.ParseURL(url)
 	if err != nil {
 		return "", err
 	}
 
-	if len(feed.Items) > 0 {
-		item := feed.Items[0]
-		return fmt.Sprintf("Title: %s\n\nDescription: %s", item.Title, item.Description), nil
+	var summary string
+	for _, item := range feed.Items {
+		summary += fmt.Sprintf("Title: %s\nLink: %s\n", item.Title, item.Link)
 	}
 
-	return "", fmt.Errorf("no items found in the feed")
+	return summary, nil
 }
