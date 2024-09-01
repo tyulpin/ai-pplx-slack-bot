@@ -1,12 +1,11 @@
-module github.com/tyulpin/ai-pplx-slack-bot
+module main.go
 
-go 1.21.7
+go 1.22.3
 
 require (
-	github.com/joho/godotenv v1.5.1
 	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/mmcdole/gofeed v1.3.0
-	github.com/slack-go/slack v0.12.3
+	github.com/slack-go/slack v0.14.0
 )
 
 require (
